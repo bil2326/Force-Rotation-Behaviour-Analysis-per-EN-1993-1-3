@@ -29,11 +29,11 @@ with st.sidebar:
 
 avec :
 
-`δ_e = (δ_e_montante + δ_e_descendante) / 2`
+`δ_e = δ_e_montante`
 
 - **δ_el** → branche montante F–δ
 - **δ_pl** → branche descendante F–δ
-- **δ_e** → moyenne des deux branches F–δ_e
+- **δ_e** → branche montante F–δ_e uniquement
 """)
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -292,19 +292,25 @@ if run:
                         if de_val_pl is None:
                             st.warning(f"⚠️ F={F:.3f} kN hors plage δ_e descendante → 0 utilisé.")
                             de_val_pl = 0.0
-                        # ── MOYENNE des deux branches (EN 1993-1-3 Fig. A.9) ─
-                        de_moy = (de_val_el + de_val_pl) / 2.0
+                        # δ_e = branche montante uniquement
+                        de_moy = de_val_el
                     else:
                         de_val_el = 0.0
                         de_val_pl = 0.0
                         de_moy    = 0.0
 
-                # ── Formule A.4a corrigée : δ_e = moyenne ───────────────────
+                # ── Condition physique : δ_pl − δ_el doit être ≥ δ_e_montante ─
+                if (dpl_val - del_val) < de_moy:
+                    errs.append(round(F, 4))
+                    continue
                 denom = 0.5 * s - e
                 if abs(denom) < 1e-12:
                     st.error("❌ Dénominateur nul : vérifiez s et e.")
                     break
                 theta = (2.0 * (dpl_val - de_moy - del_val)) / denom
+
+                # M = F·s/4  (F en kN, s en mm) → kN·m
+                M_kNm = F * s / 4.0 / 1000.0
 
                 rows.append({
                     "F (kN)":                  round(F, 4),
@@ -313,9 +319,10 @@ if run:
                     "δ_pl (mm)":               round(dpl_val, 4),
                     "δ_e montante (mm)":       round(de_val_el, 4),
                     "δ_e descendante (mm)":    round(de_val_pl, 4),
-                    "δ_e moy (mm)":            round(de_moy, 4),      # ← colonne ajoutée
+                    "δ_e moy (mm)":            round(de_moy, 4),   # = δ_e montante
                     "δ_pl − δ_el (mm)":        round(dpl_val - del_val, 4),
                     "θ (rad) [Éq. A.4a]":      round(theta, 6),
+                    "M = F·s/4 (kN·m)":        round(M_kNm, 4),
                 })
 
             if rows:
@@ -326,7 +333,10 @@ if run:
                     for r in rows
                 ]
             if errs:
-                st.warning(f"⚠️ F hors plage ignorés (kN) : {errs}")
+                st.warning(
+                    f"⚠️ Points ignorés (kN) : {errs}  \n"
+                    f"_(hors plage d'interpolation **ou** δ_pl − δ_el < δ_e_montante)_"
+                )
 
 elif "results_df" in st.session_state:
     results_df = st.session_state["results_df"]
@@ -404,6 +414,7 @@ with col2:
             "δ_e moy (mm)":            "{:.4f}",
             "δ_pl − δ_el (mm)":        "{:.4f}",
             "θ (rad) [Éq. A.4a]":      "{:.6f}",
+            "M = F·s/4 (kN·m)":        "{:.4f}",
         }
 
         styled = (results_df.style
@@ -411,17 +422,142 @@ with col2:
             .applymap(lambda _: "color:#ea580c; font-weight:bold", subset=["δ_pl (mm)"])
             .applymap(lambda _: "color:#7c3aed; font-weight:bold",
                       subset=["δ_e montante (mm)", "δ_e descendante (mm)", "δ_e moy (mm)"])
+            .applymap(lambda _: "color:#0f766e; font-weight:bold", subset=["M = F·s/4 (kN·m)"])
             .format(fmt)
         )
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
-        # ── Vérification manuelle affichée ────────────────────────────────
+        # ── Graphique M–θ (Fig. A.10 EN 1993-1-3) ────────────────────────
+        st.subheader("📈 Courbe M–θ (Fig. A.10 — EN 1993-1-3)")
+
+        # Gestion multi-essais : session_state accumule les courbes
+        st.caption(
+            "Chaque clic sur **▶ Analyser** ajoute un essai. "
+            "Cliquez sur **🗑 Effacer tous les essais** pour repartir de zéro."
+        )
+
+        # Stockage des courbes d'essais
+        if "mt_curves" not in st.session_state:
+            st.session_state["mt_curves"] = []
+
+        # Ajouter la courbe courante si elle vient d'être calculée
+        if run and results_df is not None:
+            curve_data = results_df[["θ (rad) [Éq. A.4a]", "M = F·s/4 (kN·m)"]].copy()
+            curve_data.columns = ["theta", "M"]
+            # Évite les doublons (même nb de points)
+            already = any(
+                len(c) == len(curve_data) and
+                np.allclose(c["theta"].values, curve_data["theta"].values, atol=1e-8)
+                for c in st.session_state["mt_curves"]
+            )
+            if not already:
+                st.session_state["mt_curves"].append(curve_data)
+
+        curves = st.session_state["mt_curves"]
+
+        col_mt1, col_mt2 = st.columns([3, 1])
+        with col_mt2:
+            n_essais = len(curves)
+            st.metric("Essais chargés", n_essais)
+            if st.button("🗑 Effacer tous les essais", use_container_width=True):
+                st.session_state["mt_curves"] = []
+                curves = []
+                st.rerun()
+
+        with col_mt1:
+            fig3, ax3 = plt.subplots(figsize=(8, 5))
+            ax3.set_facecolor("#f8fafc")
+            fig3.patch.set_facecolor("white")
+
+            COLORS = ["#2563eb","#ea580c","#16a34a","#7c3aed","#0891b2",
+                      "#be185d","#b45309","#374151"]
+
+            if curves:
+                # ── Tracer chaque essai ──────────────────────────────────────
+                for i, c in enumerate(curves):
+                    col_i = COLORS[i % len(COLORS)]
+                    ax3.plot(c["theta"], c["M"], color=col_i, lw=1.6,
+                             alpha=0.75, label=f"Essai {i+1}")
+
+                # ── M_mean : moyenne point par point sur θ commun ────────────
+                # On interpole toutes les courbes sur une grille θ commune
+                theta_min = max(c["theta"].min() for c in curves)
+                theta_max = min(c["theta"].max() for c in curves)
+
+                if theta_max > theta_min and len(curves) >= 1:
+                    theta_grid = np.linspace(theta_min, theta_max, 300)
+                    M_interp = np.zeros((len(curves), 300))
+                    for i, c in enumerate(curves):
+                        M_interp[i] = np.interp(
+                            theta_grid,
+                            c["theta"].values,
+                            c["M"].values
+                        )
+                    M_mean = M_interp.mean(axis=0)
+                    M_d    = 0.9 * M_mean
+
+                    ax3.plot(theta_grid, M_mean, color="#111827", lw=2.5,
+                             ls="-", label="M_mean", zorder=5)
+                    ax3.plot(theta_grid, M_d,    color="#dc2626", lw=2.2,
+                             ls="--", label="M_d = 0,9·M_mean", zorder=5)
+
+                    # Annotation flèche 0.9·M_mean à θ médian
+                    idx_mid = len(theta_grid) // 4
+                    ax3.annotate(
+                        "",
+                        xy=(theta_grid[idx_mid], M_d[idx_mid]),
+                        xytext=(theta_grid[idx_mid], M_mean[idx_mid]),
+                        arrowprops=dict(arrowstyle="<->", color="#dc2626", lw=1.5)
+                    )
+                    ax3.text(
+                        theta_grid[idx_mid] * 1.02,
+                        (M_mean[idx_mid] + M_d[idx_mid]) / 2,
+                        "0,9·M_mean",
+                        color="#dc2626", fontsize=8, va="center"
+                    )
+
+                    # Stocker M_mean/M_d pour export
+                    st.session_state["mt_grid"] = {
+                        "theta": theta_grid,
+                        "M_mean": M_mean,
+                        "M_d": M_d,
+                    }
+
+            ax3.set_xlabel("θ (rad)", fontsize=11)
+            ax3.set_ylabel("M = F·s/4  (kN·m)", fontsize=11)
+            ax3.set_title("Diagramme M–θ — Fig. A.10 (EN 1993-1-3)", fontsize=11)
+            ax3.legend(fontsize=8, loc="upper right")
+            ax3.grid(True, alpha=0.35, lw=0.6)
+            ax3.spines[["top", "right"]].set_visible(False)
+            st.pyplot(fig3, use_container_width=True)
+
+        # ── Export M–θ ────────────────────────────────────────────────────
+        if "mt_grid" in st.session_state and curves:
+            g = st.session_state["mt_grid"]
+            df_mt = pd.DataFrame({
+                "θ (rad)":        g["theta"],
+                "M_mean (kN·m)":  g["M_mean"],
+                "M_d (kN·m)":     g["M_d"],
+            })
+            buf_mt = BytesIO()
+            with pd.ExcelWriter(buf_mt, engine="openpyxl") as w:
+                df_mt.to_excel(w, index=False, sheet_name="M-theta")
+            st.download_button(
+                "⬇ Export M–θ (Excel)",
+                buf_mt.getvalue(),
+                "courbe_M_theta.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+
+        st.markdown("---")
         with st.expander("🔍 Détail calcul θ (vérification)"):
             for _, row in results_df.iterrows():
                 st.markdown(
                     f"**F = {row['F (kN)']:.4f} kN** → "
                     f"θ = 2×({row['δ_pl (mm)']:.4f} − {row['δ_e moy (mm)']:.4f} − {row['δ_el (mm)']:.4f}) "
-                    f"/ (0.5×{s:.0f} − {e:.0f}) = **{row['θ (rad) [Éq. A.4a]']:.6f} rad**"
+                    f"/ (0.5×{s:.0f} − {e:.0f}) = **{row['θ (rad) [Éq. A.4a]']:.6f} rad**  "
+                    f"_(δ_e = δ_e montante = {row['δ_e montante (mm)']:.4f} mm)_"
                 )
 
         # ── Export ────────────────────────────────────────────────────────
